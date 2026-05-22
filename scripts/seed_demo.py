@@ -170,7 +170,7 @@ def main() -> None:
     print("Demo data seeded.")
     print(f"  Company ID : {cid}")
     print(f"  Properties : {len(property_ids)}")
-    print(f"  Open the app at http://localhost:3000")
+    print(f"  Open the app at http://localhost:4000")
 
 
 if __name__ == "__main__":
