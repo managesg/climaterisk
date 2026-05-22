@@ -1,6 +1,6 @@
 """
 Individual node functions for the LangGraph workflow.
-Each node receives and returns a WorkflowState dict.
+Each node receives a WorkflowState and returns a dict of field updates.
 All AI-generated content is clearly labelled as data_source_type='ai_generated'.
 """
 import logging
@@ -13,92 +13,106 @@ logger = logging.getLogger(__name__)
 # Validation & loading
 # ---------------------------------------------------------------------------
 
-async def validate_request(state: Dict[str, Any]) -> Dict[str, Any]:
-    errors = []
-    if not state.get("company_id"):
+async def validate_request(state) -> Dict[str, Any]:
+    errors = list(state.errors)
+    if not state.company_id:
         errors.append("company_id is required")
-    if not state.get("property_ids"):
+    if not state.property_ids:
         errors.append("At least one property_id is required")
     valid_scenarios = {"SSP1-2.6", "SSP2-4.5", "SSP5-8.5", "NGFS_NET_ZERO", "NGFS_DELAYED_TRANSITION", "NGFS_HOTHOUSE"}
-    if state.get("scenario") and state["scenario"] not in valid_scenarios:
-        errors.append(f"Unknown scenario: {state['scenario']}")
-    state["errors"] = errors
+    if state.scenario and state.scenario not in valid_scenarios:
+        errors.append(f"Unknown scenario: {state.scenario}")
+    updates = {"errors": errors}
     if not errors:
-        state.setdefault("steps_completed", []).append("validate_request")
-    return state
+        updates["steps_completed"] = list(state.steps_completed) + ["validate_request"]
+    return updates
 
 
-async def load_company(state: Dict[str, Any]) -> Dict[str, Any]:
-    config = state.get("__config__", {}).get("configurable", {})
-    store = config.get("in_memory_companies", {})
-    company = store.get(state["company_id"])
+async def load_company(state) -> Dict[str, Any]:
+    from langgraph.config import get_config
+    try:
+        config = get_config()
+        store = config.get("configurable", {}).get("in_memory_companies", {})
+    except Exception:
+        store = {}
+    company = store.get(state.company_id)
+    gaps = list(state.data_gaps)
     if company is None:
-        # Return a placeholder so the workflow can continue with available data
         company = {
-            "company_id": state["company_id"],
+            "company_id": state.company_id,
             "name": "Unknown Company",
             "sector": "Unknown",
             "industry": "Unknown",
             "geography": "Unknown",
         }
-        state.setdefault("data_gaps", []).append("Company record not found — using placeholder")
-    state["company"] = company
-    state.setdefault("steps_completed", []).append("load_company")
-    return state
+        gaps.append("Company record not found — using placeholder")
+    return {
+        "company": company,
+        "data_gaps": gaps,
+        "steps_completed": list(state.steps_completed) + ["load_company"],
+    }
 
 
-async def load_properties(state: Dict[str, Any]) -> Dict[str, Any]:
-    config = state.get("__config__", {}).get("configurable", {})
-    store = config.get("in_memory_properties", {})
+async def load_properties(state) -> Dict[str, Any]:
+    from langgraph.config import get_config
+    try:
+        config = get_config()
+        store = config.get("configurable", {}).get("in_memory_properties", {})
+    except Exception:
+        store = {}
     found = []
-    missing = []
-    for pid in state.get("property_ids", []):
+    gaps = list(state.data_gaps)
+    for pid in state.property_ids:
         prop = store.get(pid)
         if prop:
             found.append(prop)
         else:
-            missing.append(pid)
-            state.setdefault("data_gaps", []).append(f"Property {pid} not found in store")
-    state["properties"] = found
-    state.setdefault("steps_completed", []).append("load_properties")
-    return state
+            gaps.append(f"Property {pid} not found in store")
+    return {
+        "properties": found,
+        "data_gaps": gaps,
+        "steps_completed": list(state.steps_completed) + ["load_properties"],
+    }
 
 
-async def geocode_or_validate_coordinates(state: Dict[str, Any]) -> Dict[str, Any]:
+async def geocode_or_validate_coordinates(state) -> Dict[str, Any]:
     validated = []
-    for prop in state.get("properties", []):
+    gaps = list(state.data_gaps)
+    errors = list(state.errors)
+    for prop in state.properties:
         lat = prop.get("latitude")
         lon = prop.get("longitude")
         if lat is None or lon is None:
-            state.setdefault("data_gaps", []).append(
-                f"Property {prop.get('property_id', '?')} missing coordinates — cannot score"
-            )
+            gaps.append(f"Property {prop.get('property_id', '?')} missing coordinates — cannot score")
             continue
         if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
-            state.setdefault("errors", []).append(
-                f"Property {prop.get('property_id', '?')} has invalid coordinates"
-            )
+            errors.append(f"Property {prop.get('property_id', '?')} has invalid coordinates")
             continue
+        prop = dict(prop)
         prop["geocode_validated"] = True
         validated.append(prop)
-    state["properties"] = validated
-    state.setdefault("steps_completed", []).append("geocode_or_validate_coordinates")
-    return state
+    return {
+        "properties": validated,
+        "data_gaps": gaps,
+        "errors": errors,
+        "steps_completed": list(state.steps_completed) + ["geocode_or_validate_coordinates"],
+    }
 
 
-async def enrich_building_context(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Fill in missing building context where possible from open proxies.
-    Clearly marks inferred data.
-    """
-    for prop in state.get("properties", []):
+async def enrich_building_context(state) -> Dict[str, Any]:
+    enriched = []
+    for prop in state.properties:
+        prop = dict(prop)
         if prop.get("country") is None:
             lat = prop.get("latitude", 0)
             lon = prop.get("longitude", 0)
             prop["country"] = _coarse_country_from_coords(lat, lon)
             prop["_country_inferred"] = True
-    state.setdefault("steps_completed", []).append("enrich_building_context")
-    return state
+        enriched.append(prop)
+    return {
+        "properties": enriched,
+        "steps_completed": list(state.steps_completed) + ["enrich_building_context"],
+    }
 
 
 def _coarse_country_from_coords(lat: float, lon: float) -> str:
@@ -119,96 +133,102 @@ def _coarse_country_from_coords(lat: float, lon: float) -> str:
 # Physical risk scoring
 # ---------------------------------------------------------------------------
 
-async def score_physical_risk(state: Dict[str, Any]) -> Dict[str, Any]:
+async def score_physical_risk(state) -> Dict[str, Any]:
     from app.hazards.scorer import score_property
     results = []
-    for prop in state.get("properties", []):
+    evidence = list(state.evidence)
+    gaps = list(state.data_gaps)
+    for prop in state.properties:
         lat = prop.get("latitude", 0)
         lon = prop.get("longitude", 0)
         result = score_property(
             lat=lat,
             lon=lon,
             property_attrs=prop,
-            scenario=state.get("scenario", "SSP2-4.5"),
-            time_horizon=state.get("time_horizon", "2050"),
+            scenario=state.scenario,
+            time_horizon=state.time_horizon,
         )
         result["property_id"] = prop.get("property_id", "")
         result["property_name"] = prop.get("name", "")
         results.append(result)
-        state.setdefault("evidence", []).extend(result.get("evidence", []))
-        state.setdefault("data_gaps", []).extend(result.get("data_gaps", []))
-    state["physical_risk_results"] = results
-    state.setdefault("steps_completed", []).append("score_physical_risk")
-    return state
+        evidence.extend(result.get("evidence", []))
+        gaps.extend(result.get("data_gaps", []))
+    return {
+        "physical_risk_results": results,
+        "evidence": evidence,
+        "data_gaps": gaps,
+        "steps_completed": list(state.steps_completed) + ["score_physical_risk"],
+    }
 
 
 # ---------------------------------------------------------------------------
 # Transition risk
 # ---------------------------------------------------------------------------
 
-async def run_transition_risk_agent(state: Dict[str, Any]) -> Dict[str, Any]:
+async def run_transition_risk_agent(state) -> Dict[str, Any]:
     from app.transition.transition_risk import TransitionRiskEngine
-    company = state.get("company") or {}
-    physical_results = state.get("physical_risk_results", [])
+    company = state.company or {}
     engine = TransitionRiskEngine()
     risks = engine.assess(
         sector=company.get("sector", "Unknown"),
         industry=company.get("industry", "Unknown"),
         geography=company.get("geography", "Unknown"),
-        scenario=state.get("scenario", "SSP2-4.5"),
-        physical_risk_results=physical_results,
+        scenario=state.scenario,
+        physical_risk_results=state.physical_risk_results,
     )
-    state["transition_risks"] = risks
-    state.setdefault("steps_completed", []).append("run_transition_risk_agent")
-    return state
+    return {
+        "transition_risks": risks,
+        "steps_completed": list(state.steps_completed) + ["run_transition_risk_agent"],
+    }
 
 
 # ---------------------------------------------------------------------------
 # Opportunities
 # ---------------------------------------------------------------------------
 
-async def run_climate_opportunities_agent(state: Dict[str, Any]) -> Dict[str, Any]:
+async def run_climate_opportunities_agent(state) -> Dict[str, Any]:
     from app.opportunities.opportunities import OpportunitiesEngine
-    company = state.get("company") or {}
+    company = state.company or {}
     engine = OpportunitiesEngine()
     opps = engine.identify(
         sector=company.get("sector", "Unknown"),
         industry=company.get("industry", "Unknown"),
-        scenario=state.get("scenario", "SSP2-4.5"),
-        physical_risk_results=state.get("physical_risk_results", []),
-        transition_risks=state.get("transition_risks", []),
+        scenario=state.scenario,
+        physical_risk_results=state.physical_risk_results,
+        transition_risks=state.transition_risks,
     )
-    state["opportunities"] = opps
-    state.setdefault("steps_completed", []).append("run_climate_opportunities_agent")
-    return state
+    return {
+        "opportunities": opps,
+        "steps_completed": list(state.steps_completed) + ["run_climate_opportunities_agent"],
+    }
 
 
 # ---------------------------------------------------------------------------
 # Nature risk
 # ---------------------------------------------------------------------------
 
-async def run_nature_risk_agent(state: Dict[str, Any]) -> Dict[str, Any]:
+async def run_nature_risk_agent(state) -> Dict[str, Any]:
     from app.nature.nature_risk import NatureRiskEngine
-    company = state.get("company") or {}
+    company = state.company or {}
     engine = NatureRiskEngine()
     nature = engine.assess(
         sector=company.get("sector", "Unknown"),
         industry=company.get("industry", "Unknown"),
-        properties=state.get("properties", []),
+        properties=state.properties,
     )
-    state["nature_risks"] = nature
-    state.setdefault("steps_completed", []).append("run_nature_risk_agent")
-    return state
+    return {
+        "nature_risks": nature,
+        "steps_completed": list(state.steps_completed) + ["run_nature_risk_agent"],
+    }
 
 
 # ---------------------------------------------------------------------------
 # Validation and confidence
 # ---------------------------------------------------------------------------
 
-async def validate_evidence(state: Dict[str, Any]) -> Dict[str, Any]:
-    issues = []
-    physical = state.get("physical_risk_results", [])
-    for result in physical:
+async def validate_evidence(state) -> Dict[str, Any]:
+    issues = list(state.review_reasons)
+    for result in state.physical_risk_results:
         if result.get("overall_score", 0) > 60:
             evidence = result.get("evidence", [])
             if len(evidence) < 2:
@@ -216,27 +236,28 @@ async def validate_evidence(state: Dict[str, Any]) -> Dict[str, Any]:
                     f"High-risk property {result.get('property_id', '?')} "
                     f"has insufficient evidence for disclosure claim"
                 )
-    state["review_reasons"] = state.get("review_reasons", []) + issues
-    state.setdefault("steps_completed", []).append("validate_evidence")
-    return state
+    return {
+        "review_reasons": issues,
+        "steps_completed": list(state.steps_completed) + ["validate_evidence"],
+    }
 
 
-async def check_confidence(state: Dict[str, Any]) -> Dict[str, Any]:
-    physical = state.get("physical_risk_results", [])
+async def check_confidence(state) -> Dict[str, Any]:
+    physical = state.physical_risk_results
     if not physical:
-        state["confidence"] = 0.0
-        state["requires_human_review"] = True
-        state.setdefault("review_reasons", []).append("No physical risk results to evaluate")
-        state.setdefault("steps_completed", []).append("check_confidence")
-        return state
+        return {
+            "confidence": 0.0,
+            "requires_human_review": True,
+            "review_reasons": list(state.review_reasons) + ["No physical risk results to evaluate"],
+            "steps_completed": list(state.steps_completed) + ["check_confidence"],
+        }
 
     conf_map = {"high": 0.9, "medium": 0.7, "low": 0.5, "very_low": 0.3}
     confs = [conf_map.get(r.get("confidence", "low"), 0.5) for r in physical]
     avg_conf = sum(confs) / len(confs)
-    state["confidence"] = round(avg_conf, 3)
 
     needs_review = False
-    reasons = list(state.get("review_reasons", []))
+    reasons = list(state.review_reasons)
 
     if avg_conf < 0.70:
         needs_review = True
@@ -251,32 +272,35 @@ async def check_confidence(state: Dict[str, Any]) -> Dict[str, Any]:
             )
             break
 
-    state["requires_human_review"] = needs_review
-    state["review_reasons"] = reasons
-    state.setdefault("steps_completed", []).append("check_confidence")
-    return state
+    return {
+        "confidence": round(avg_conf, 3),
+        "requires_human_review": needs_review,
+        "review_reasons": reasons,
+        "steps_completed": list(state.steps_completed) + ["check_confidence"],
+    }
 
 
 # ---------------------------------------------------------------------------
 # Disclosure
 # ---------------------------------------------------------------------------
 
-async def generate_disclosure_summary(state: Dict[str, Any]) -> Dict[str, Any]:
+async def generate_disclosure_summary(state) -> Dict[str, Any]:
     from app.disclosure.generator import DisclosureGenerator
     gen = DisclosureGenerator()
     summary = gen.generate(
-        company=state.get("company") or {},
-        properties=state.get("properties", []),
-        physical_risk_results=state.get("physical_risk_results", []),
-        transition_risks=state.get("transition_risks", []),
-        nature_risks=state.get("nature_risks", []),
-        opportunities=state.get("opportunities", []),
-        scenario=state.get("scenario", "SSP2-4.5"),
-        time_horizon=state.get("time_horizon", "2050"),
-        confidence=state.get("confidence", 0.0),
-        data_gaps=state.get("data_gaps", []),
-        assumptions=state.get("assumptions", []),
+        company=state.company or {},
+        properties=state.properties,
+        physical_risk_results=state.physical_risk_results,
+        transition_risks=state.transition_risks,
+        nature_risks=state.nature_risks,
+        opportunities=state.opportunities,
+        scenario=state.scenario,
+        time_horizon=state.time_horizon,
+        confidence=state.confidence,
+        data_gaps=state.data_gaps,
+        assumptions=state.assumptions,
     )
-    state["disclosure_summary"] = summary
-    state.setdefault("steps_completed", []).append("generate_disclosure_summary")
-    return state
+    return {
+        "disclosure_summary": summary,
+        "steps_completed": list(state.steps_completed) + ["generate_disclosure_summary"],
+    }
