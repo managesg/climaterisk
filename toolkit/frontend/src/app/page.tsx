@@ -228,13 +228,13 @@ function DisclosurePanel() {
               return (
                 <div key={key} className="bg-slate-700/50 rounded-lg p-3">
                   <p className="text-xs font-bold text-slate-300 mb-2">{section.section as string}</p>
-                  {section.data_source_type && (
+                  {section.data_source_type != null && (
                     <span className="text-xs bg-purple-900/40 text-purple-300 px-2 py-0.5 rounded-full">
-                      {section.data_source_type as string}
+                      {String(section.data_source_type)}
                     </span>
                   )}
-                  {section.narrative && (
-                    <p className="text-xs text-slate-400 mt-2">{section.narrative as string}</p>
+                  {section.narrative != null && (
+                    <p className="text-xs text-slate-400 mt-2">{String(section.narrative)}</p>
                   )}
                 </div>
               );

@@ -65,6 +65,14 @@ async def _run_workflow_background(run_id: str, request: AssessmentRequest):
             run_data["confidence"] = result_state.confidence
             run_data["evidence"] = result_state.evidence
             run_data["workflow_steps_completed"] = result_state.steps_completed
+            run_data["scenario"] = request.scenario
+            run_data["time_horizon"] = request.time_horizon
+            run_data["physical_risk_results"] = result_state.physical_risk_results
+            run_data["transition_risks"] = result_state.transition_risks
+            run_data["nature_risks"] = result_state.nature_risks
+            run_data["opportunities"] = result_state.opportunities
+            run_data["data_gaps"] = result_state.data_gaps
+            run_data["assumptions"] = result_state.assumptions
             run_data["updated_at"] = datetime.utcnow().isoformat()
             await save_agent_run(run_data)
 
@@ -106,7 +114,7 @@ async def list_runs(company_id: Optional[str] = None):
 
 
 @router.post("/run/{run_id}/review")
-async def submit_human_review(run_id: str, decision: HumanReviewDecision):
+async def submit_human_review(run_id: str, decision: HumanReviewDecision, background_tasks: BackgroundTasks):
     run = await get_agent_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
@@ -122,7 +130,50 @@ async def submit_human_review(run_id: str, decision: HumanReviewDecision):
     run["state"] = AgentRunState.COMPLETED.value if decision.approved else AgentRunState.FAILED.value
     run["updated_at"] = datetime.utcnow().isoformat()
     await save_agent_run(run)
+
+    if decision.approved:
+        background_tasks.add_task(_generate_disclosure_after_review, run_id)
+
     return {"run_id": run_id, "state": run["state"], "approved": decision.approved}
+
+
+async def _generate_disclosure_after_review(run_id: str):
+    """Generate disclosure summary after human review approval."""
+    try:
+        from app.agents.nodes import generate_disclosure_summary
+        from app.agents.states import WorkflowState
+        run = await get_agent_run(run_id)
+        if not run:
+            return
+        # Reconstruct enough state to generate disclosure
+        companies = get_all_companies_dict()
+        properties = get_all_properties_dict()
+        company = companies.get(run.get("company_id", ""), {})
+        props = [properties.get(pid, {}) for pid in run.get("property_ids", []) if pid in properties]
+        state = WorkflowState(
+            company_id=run.get("company_id", ""),
+            property_ids=run.get("property_ids", []),
+            company=company,
+            properties=props,
+            physical_risk_results=run.get("physical_risk_results", []),
+            transition_risks=run.get("transition_risks", []),
+            nature_risks=run.get("nature_risks", {}),
+            opportunities=run.get("opportunities", []),
+            scenario=run.get("scenario", "SSP2-4.5"),
+            time_horizon=run.get("time_horizon", "2050"),
+            confidence=run.get("confidence", 0.0),
+            data_gaps=run.get("data_gaps", []),
+            assumptions=run.get("assumptions", []),
+            steps_completed=run.get("workflow_steps_completed", []),
+            evidence=run.get("evidence", []),
+        )
+        result = await generate_disclosure_summary(state)
+        run["final_output"] = result.get("disclosure_summary")
+        run["workflow_steps_completed"] = result.get("steps_completed", state.steps_completed)
+        run["updated_at"] = datetime.utcnow().isoformat()
+        await save_agent_run(run)
+    except Exception as e:
+        logger.error("Disclosure generation after review failed for run %s: %s", run_id, e, exc_info=True)
 
 
 # Optional str type hint fix
